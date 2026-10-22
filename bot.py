@@ -227,6 +227,9 @@ def cairo_today():
     return datetime.now(timezone(timedelta(hours=3))).date().isoformat()
 
 
+CAT_SLUGS = []   # category names learned from Best Sellers, reused for Movers & Shakers
+
+
 def scan(session, kinds, stats):
     seen = {}
     for kind in kinds:
@@ -237,6 +240,10 @@ def scan(session, kinds, stats):
         stats["ok"] += 1
         seen.update(parse_items(root))
         cats = category_paths(root, kind)[:MAX_CATEGORIES]
+        if kind == "bestsellers" and cats:
+            CAT_SLUGS[:] = [c.rstrip("/").split("/")[-1] for c in cats]
+        if not cats and CAT_SLUGS:      # Movers & Shakers page hides its category links
+            cats = [f"/-/en/gp/{kind}/{slug}/" for slug in CAT_SLUGS]
         stats["cats"][kind] = len(cats)
         for path in cats:
             time.sleep(random.uniform(*DELAY))
@@ -315,7 +322,7 @@ def main():
         cycle_start = time.time()
         kinds = list(FAST_KINDS)
         if cycle_start - last_slow >= SLOW_EVERY * 60:
-            kinds += SLOW_KINDS
+            kinds = SLOW_KINDS + kinds      # Best Sellers first, to learn the categories
             last_slow = cycle_start
         stats = {"ok": 0, "failed": 0, "cats": {}}
         seen = scan(session, kinds, stats)
