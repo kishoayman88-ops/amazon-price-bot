@@ -89,7 +89,7 @@ def is_blocked(page):
 
 def fetch(session, path):
     url = path if path.startswith("http") else BASE + path
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             r = session.get(url, headers={
                 "User-Agent": random.choice(USER_AGENTS),
@@ -101,7 +101,7 @@ def fetch(session, path):
             print(f"  blocked/err {r.status_code} on {url} (try {attempt + 1})")
         except requests.RequestException as e:
             print(f"  network error on {url}: {e}")
-        time.sleep(8 * (attempt + 1))
+        time.sleep(4 * (attempt + 1))
     return None
 
 
@@ -413,11 +413,7 @@ def process(db, seen, stats):
         time.sleep(1)
 
     total = stats["ok"] + stats["failed"]
-    blocked = bool(total) and stats["failed"] / total > 0.5
-    if blocked and db["meta"].get("block_notice") != today:
-        db["meta"]["block_notice"] = today
-        send_telegram(f"⚠️ Amazon blocked {stats['failed']} of {total} pages. "
-                      "The bot will slow down and keep trying.")
+    fail_rate = stats["failed"] / total if total else 0
 
     m = db["meta"]
     m["last_check"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -431,7 +427,7 @@ def process(db, seen, stats):
     save_db(db)
     print(f"{m['last_check']} pages ok={stats['ok']} failed={stats['failed']} "
           f"items={len(seen)} tracked={len(db['items'])} alerts={len(alerts)}", flush=True)
-    return blocked
+    return fail_rate
 
 
 def git_save(message="Update prices"):
@@ -465,6 +461,9 @@ def main():
     start = time.time()
     last_slow = -1e18
     last_save = time.time()
+    # Adaptive speed: slow down when Amazon blocks, speed up again when it's fine.
+    speeds = [FAST_EVERY, 2, 3, 5, 10, 20]
+    level, clean = 0, 0
 
     while True:
         cycle_start = time.time()
@@ -474,7 +473,7 @@ def main():
             seen.update(scan(session, SLOW_KINDS, stats))
             last_slow = cycle_start
         seen.update(scan_fast(session, stats))
-        blocked = process(db, seen, stats)
+        fail_rate = process(db, seen, stats)
 
         if RUN_MINUTES <= 0:
             break
@@ -482,10 +481,23 @@ def main():
             git_save()
             last_save = time.time()
 
-        wait = FAST_EVERY * 60 - (time.time() - cycle_start)
-        if blocked:
-            wait = max(wait, 10 * 60)              # back off when Amazon blocks
-            session = requests.Session()
+        if fail_rate > 0.2:                         # being blocked -> slow down
+            level, clean = min(level + 1, len(speeds) - 1), 0
+            session = requests.Session()           # fresh cookies
+        elif fail_rate == 0:
+            clean += 1
+            if level and clean >= 10:              # 10 clean checks -> speed up
+                level, clean = level - 1, 0
+        if level != db["meta"].get("speed_level", 0):
+            old = speeds[db["meta"].get("speed_level", 0)]
+            db["meta"]["speed_level"] = level
+            if level == 0:
+                send_telegram(f"✅ Amazon is OK again. Back to checking every {speeds[0]:g} min.")
+            elif level > 0 and old == speeds[0]:
+                send_telegram(f"🐢 Amazon is blocking some checks. Slowing down to every "
+                              f"{speeds[level]:g} min, will speed up again automatically.")
+            save_db(db)
+        wait = speeds[level] * 60 - (time.time() - cycle_start)
         if time.time() + max(wait, 0) - start > RUN_MINUTES * 60:
             break
         time.sleep(max(wait, 5))
