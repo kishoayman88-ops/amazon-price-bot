@@ -185,7 +185,7 @@ def check_item(db, asin, item, today):
             last = rec.get("alerted")
             if last is None or price < last:      # alert again only if even lower
                 rec["alerted"] = price
-                alert = {"asin": asin, "title": item["title"],
+                alert = {"asin": asin, "title": item["title"], "device": item.get("device", False),
                          "price": price, "usual": usual}
         else:
             rec["alerted"] = None                  # price recovered -> reset
@@ -207,7 +207,8 @@ def forget_old(db, today):
 
 def alert_text(a):
     drop = round((1 - a["price"] / a["usual"]) * 100)
-    return (f"🔥 <b>Price drop {drop}%</b>\n"
+    label = "⚡ <b>Device deal</b> · " if a.get("device") else "🔥 "
+    return (f"{label}<b>Price drop {drop}%</b>\n"
             f"{html.escape(a['title'])}\n\n"
             f"Now: <b>EGP {a['price']:,.2f}</b>\n"
             f"Usual: EGP {a['usual']:,.2f}\n"
@@ -228,6 +229,48 @@ def cairo_today():
 
 
 CAT_SLUGS = []   # category names learned from Best Sellers, reused for Movers & Shakers
+
+# ---- Electric devices: deeper scan of sub-categories ----
+DEVICE_WORDS = ("electronic", "computer", "appliance", "kitchen", "phone",
+                "tv", "camera", "video-game", "office-product")
+DEVICE_BATCH = int(os.getenv("DEVICE_BATCH", "10"))       # sub-pages per 3-min check
+MAX_DEVICE_PAGES = int(os.getenv("MAX_DEVICE_PAGES", "300"))
+DEVICE_PAGES = []       # rotating list of device sub-category pages
+DEVICE_POS = [0]
+
+
+def is_device(slug):
+    return any(w in slug for w in DEVICE_WORDS)
+
+
+def learn_device_pages(page, slug):
+    """Add sub-category pages (Best Sellers + Movers & Shakers) found on a device page."""
+    for node in re.findall(rf"/gp/bestsellers/{re.escape(slug)}/(\d+)", page):
+        for kind in ("bestsellers", "movers-and-shakers"):
+            path = f"/-/en/gp/{kind}/{slug}/{node}/"
+            if path not in DEVICE_PAGES and len(DEVICE_PAGES) < MAX_DEVICE_PAGES:
+                DEVICE_PAGES.append(path)
+
+
+def scan_devices(session, stats):
+    seen = {}
+    n = min(DEVICE_BATCH, len(DEVICE_PAGES))
+    for _ in range(n):
+        path = DEVICE_PAGES[DEVICE_POS[0] % len(DEVICE_PAGES)]
+        DEVICE_POS[0] += 1
+        time.sleep(random.uniform(*DELAY))
+        page = fetch(session, path)
+        if page is None:
+            stats["failed"] += 1
+            continue
+        stats["ok"] += 1
+        if "/bestsellers/" in path:          # go one level deeper
+            learn_device_pages(page, path.split("/")[5])
+        for asin, item in parse_items(page).items():
+            item["device"] = True
+            seen[asin] = item
+    stats["device_pages"] = len(DEVICE_PAGES)
+    return seen
 
 
 def scan(session, kinds, stats):
@@ -252,7 +295,14 @@ def scan(session, kinds, stats):
                 stats["failed"] += 1
                 continue
             stats["ok"] += 1
-            seen.update(parse_items(page))
+            slug = path.rstrip("/").split("/")[-1]
+            items = parse_items(page)
+            if is_device(slug):
+                if kind == "bestsellers":
+                    learn_device_pages(page, slug)
+                for it in items.values():
+                    it["device"] = True
+            seen.update(items)
     return seen
 
 
@@ -276,6 +326,7 @@ def process(db, seen, stats):
     m["last_check"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     m["last_pages_ok"], m["last_pages_failed"] = stats["ok"], stats["failed"]
     m["categories"] = stats["cats"]
+    m["device_pages"] = stats.get("device_pages", 0)
     m["checks_today"] = (m.get("checks_today", 0) + 1) if m.get("checks_day") == today else 1
     m["checks_day"] = today
     m["alerts_total"] = m.get("alerts_total", 0) + len(alerts)
@@ -326,6 +377,7 @@ def main():
             last_slow = cycle_start
         stats = {"ok": 0, "failed": 0, "cats": {}}
         seen = scan(session, kinds, stats)
+        seen.update(scan_devices(session, stats))
         blocked = process(db, seen, stats)
 
         if RUN_MINUTES <= 0:
