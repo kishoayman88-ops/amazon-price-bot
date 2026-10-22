@@ -33,8 +33,9 @@ MIN_DAYS_HISTORY = 2      # days of prices needed before an item can alert
 KEEP_DAYS = 30            # days of price history to keep per item
 DELAY = (2.0, 4.0)        # seconds to wait between pages (be gentle)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TG_ERRORS = []   # saved into prices.json so problems are easy to see
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -53,8 +54,10 @@ CAT_RE = re.compile(r"/gp/(bestsellers|movers-and-shakers)/([a-z0-9][a-z0-9\-_]*
 # ---------------- Telegram ----------------
 def send_telegram(text):
     if not TOKEN or not CHAT_ID:
-        print("[telegram] missing token/chat id, message:\n", text)
-        return
+        TG_ERRORS.append("missing secret: " + ("TELEGRAM_BOT_TOKEN " if not TOKEN else "")
+                         + ("TELEGRAM_CHAT_ID" if not CHAT_ID else ""))
+        print("[telegram]", TG_ERRORS[-1])
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -62,9 +65,14 @@ def send_telegram(text):
             timeout=20,
         )
         if r.status_code != 200:
-            print("[telegram] error:", r.status_code, r.text[:200])
+            TG_ERRORS.append(f"{r.status_code}: {r.text[:200]}")
+            print("[telegram] error:", TG_ERRORS[-1])
+            return False
+        return True
     except requests.RequestException as e:
-        print("[telegram] failed:", e)
+        TG_ERRORS.append("network: " + str(e).replace(TOKEN, "***")[:200])
+        print("[telegram] failed:", TG_ERRORS[-1])
+        return False
 
 
 # ---------------- Fetching ----------------
@@ -208,8 +216,9 @@ def alert_text(a):
 
 # ---------------- Main ----------------
 def main():
+    test_ok = True
     if os.getenv("TEST_ALERT", "").lower() == "true":
-        send_telegram("✅ Amazon.eg price bot is working. "
+        test_ok = send_telegram("✅ Amazon.eg price bot is working. "
                       f"It will alert on drops of {DROP_PERCENT:.0f}% or more.")
 
     db = load_db()
@@ -251,11 +260,15 @@ def main():
         send_telegram(f"⚠️ Amazon blocked {pages_failed} of {total} pages this run. "
                       "The bot will keep trying.")
 
+    db["meta"]["telegram_errors"] = TG_ERRORS[-5:]
+    db["meta"]["token_shape_ok"] = bool(re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", TOKEN))
+    db["meta"]["chat_id_shape_ok"] = bool(re.fullmatch(r"-?\d+", CHAT_ID))
     db["meta"]["last_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_db(db)
     print(f"pages ok={pages_ok} failed={pages_failed} items={len(seen)} "
           f"tracked={len(db['items'])} alerts={len(alerts)} forgotten={removed}")
+    return 0 if test_ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

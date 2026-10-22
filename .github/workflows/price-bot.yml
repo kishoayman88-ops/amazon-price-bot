@@ -39,6 +39,7 @@ jobs:
           DROP_PERCENT: "70"
 
       - name: Save prices
+        if: always()
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
