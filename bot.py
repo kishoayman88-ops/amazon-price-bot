@@ -42,7 +42,7 @@ PRIORITY_BATCH = int(os.getenv("DEVICE_BATCH", "4"))     # priority sub-pages pe
 ROTATE_BATCH = int(os.getenv("ROTATE_BATCH", "4"))       # other categories per check
 WATCH_BATCH = int(os.getenv("WATCH_BATCH", "10"))        # watchlist items per check
 WATCH_MAX = 30
-MAX_PRIORITY_PAGES = int(os.getenv("MAX_DEVICE_PAGES", "300"))
+MAX_PRIORITY_PAGES = int(os.getenv("MAX_DEVICE_PAGES", "400"))
 
 RUN_MINUTES = float(os.getenv("RUN_MINUTES", "0"))       # 0 = one full pass, then stop
 FAST_EVERY = float(os.getenv("FAST_EVERY", "1"))
@@ -326,7 +326,10 @@ class Sniper:
         self.session = requests.Session()
         self.slugs = []                 # top-level categories (from Best Sellers)
         self.priority_pages = []        # device & supermarket sub-category pages
-        self.pos = {"pri": 0, "rot": 0, "watch": 0}
+        self.other_pages = []           # sub-category pages of all other categories
+        self.page2 = []                 # page 2 of the busiest lists
+        self.empty = {}                 # path -> times in a row with no priced items
+        self.pos = {"pri": 0, "rot": 0, "watch": 0, "oth": 0, "pg2": 0}
         self.stats = None
         self.alerts = 0
 
@@ -351,15 +354,35 @@ class Sniper:
     def read(self, path, movers, group=None):
         page = self.get(path)
         if page:
-            self.emit(parse_items(page, movers), group)
+            items = parse_items(page, movers)
+            self.emit(items, group)
+            # Stop wasting requests on pages that never show priced products
+            self.empty[path] = 0 if items else self.empty.get(path, 0) + 1
+            if self.empty[path] >= 3:
+                for lst in (self.priority_pages, self.other_pages, self.page2):
+                    if path in lst:
+                        lst.remove(path)
         return page
 
     def learn(self, page, slug):
+        lst = self.priority_pages if group_of(slug) else self.other_pages
+        cap = MAX_PRIORITY_PAGES if group_of(slug) else MAX_PRIORITY_PAGES // 2
         for node in re.findall(rf"/gp/bestsellers/{re.escape(slug)}/(\d+)", page):
             for kind in ("movers-and-shakers", "bestsellers"):
                 p = f"/-/en/gp/{kind}/{slug}/{node}/"
-                if p not in self.priority_pages and len(self.priority_pages) < MAX_PRIORITY_PAGES:
-                    self.priority_pages.append(p)
+                if p not in lst and len(lst) < cap and self.empty.get(p, 0) < 3:
+                    lst.append(p)
+
+    def rotate(self, lst, key, n):
+        for _ in range(min(n, len(lst))):
+            if not lst:
+                return
+            path = lst[self.pos[key] % len(lst)]
+            self.pos[key] += 1
+            slug = path.split("/")[5]
+            page = self.read(path, "movers-and-shakers" in path, group_of(slug))
+            if page and "/bestsellers/" in path and "?pg=" not in path:
+                self.learn(page, slug)
 
     # -- every 30 min: all Best Sellers categories --
     def scan_slow(self):
@@ -373,8 +396,13 @@ class Sniper:
         for path in cats:
             slug = path.rstrip("/").split("/")[-1]
             page = self.read(path, False, group_of(slug))
-            if page and group_of(slug):
+            if page:
                 self.learn(page, slug)
+            if self.empty.get(path + "?pg=2", 0) < 3:
+                self.read(path + "?pg=2", False, group_of(slug))     # ~20 more products
+        # page 2 of Movers & Shakers for priority categories, read in the fast loop
+        self.page2 = [f"/-/en/gp/movers-and-shakers/{s}/?pg=2" for s in self.slugs
+                      if group_of(s) and self.empty.get(f"/-/en/gp/movers-and-shakers/{s}/?pg=2", 0) < 3]
 
     # -- every minute: hottest pages first --
     def scan_fast(self):
@@ -388,15 +416,13 @@ class Sniper:
             slug = other[self.pos["rot"] % len(other)]
             self.pos["rot"] += 1
             self.read(f"/-/en/gp/{kind}/{slug}/", True)
-        for _ in range(min(PRIORITY_BATCH, len(self.priority_pages))):
-            path = self.priority_pages[self.pos["pri"] % len(self.priority_pages)]
-            self.pos["pri"] += 1
-            slug = path.split("/")[5]
-            page = self.read(path, "movers-and-shakers" in path, group_of(slug))
-            if page and "/bestsellers/" in path:
-                self.learn(page, slug)
+        self.rotate(self.page2, "pg2", 2)
+        self.rotate(self.priority_pages, "pri", PRIORITY_BATCH)
+        self.rotate(self.other_pages, "oth", 2)
         self.stats["cats"] = {"priority": pri, "other": len(other),
-                              "sub_pages": len(self.priority_pages)}
+                              "priority_sub_pages": len(self.priority_pages),
+                              "other_sub_pages": len(self.other_pages),
+                              "skipped_empty": sum(1 for v in self.empty.values() if v >= 3)}
 
     # -- watchlist --
     def scan_watch(self):
