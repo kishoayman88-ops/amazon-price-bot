@@ -203,7 +203,7 @@ def check_item(db, asin, item, today):
     past = ([p for d, p in rec["h"].items() if d != today]
             + [p for h, p in recent.items() if h != hour])
     usual = statistics.median(past) if len(past) >= MIN_SAMPLES else None
-    base = {"asin": asin, "title": item["title"], "device": item.get("device", False),
+    base = {"asin": asin, "title": item["title"], "group": item.get("group"),
             "price": price, "usual": usual}
     alert = None
 
@@ -247,7 +247,7 @@ def forget_old(db, today):
 
 
 def alert_text(a):
-    dev = "⚡ <b>Device</b> · " if a.get("device") else ""
+    dev = {"device": "⚡ <b>Device</b> · ", "market": "🛒 <b>Supermarket</b> · "}.get(a.get("group"), "")
     title = html.escape(a["title"])
     link = f"https://www.amazon.eg/dp/{a['asin']}"
     usual = (f"Usual: EGP {a['usual']:,.2f} "
@@ -288,8 +288,20 @@ DEVICE_PAGES = []       # rotating list of device sub-category pages
 DEVICE_POS = [0]
 
 
-def is_device(slug):
-    return any(w in slug for w in DEVICE_WORDS)
+MARKET_WORDS = ("grocery", "health", "beauty", "baby", "pet", "household")
+
+
+def group_of(slug):
+    """'device', 'market' (supermarket) or None."""
+    if any(w in slug for w in DEVICE_WORDS):
+        return "device"
+    if any(w in slug for w in MARKET_WORDS):
+        return "market"
+    return None
+
+
+def is_device(slug):          # any priority group (devices or supermarket)
+    return group_of(slug) is not None
 
 
 def learn_device_pages(page, slug):
@@ -316,13 +328,13 @@ def scan_devices(session, stats):
         if "/bestsellers/" in path:          # go one level deeper
             learn_device_pages(page, path.split("/")[5])
         for asin, item in parse_items(page, movers="movers-and-shakers" in path).items():
-            item["device"] = True
+            item["group"] = group_of(path.split("/")[5])
             seen[asin] = item
     stats["device_pages"] = len(DEVICE_PAGES)
     return seen
 
 
-def fetch_into(session, path, seen, stats, movers, device):
+def fetch_into(session, path, seen, stats, movers, group):
     time.sleep(random.uniform(*DELAY))
     page = fetch(session, path)
     if page is None:
@@ -330,8 +342,8 @@ def fetch_into(session, path, seen, stats, movers, device):
         return
     stats["ok"] += 1
     for asin, item in parse_items(page, movers=movers).items():
-        if device:
-            item["device"] = True
+        if group:
+            item["group"] = group
         seen[asin] = item
 
 
@@ -340,16 +352,16 @@ def scan_fast(session, stats):
     plus a few other categories and device sub-pages in rotation."""
     seen = {}
     kind = "movers-and-shakers"
-    fetch_into(session, f"/-/en/gp/{kind}/", seen, stats, True, False)
+    fetch_into(session, f"/-/en/gp/{kind}/", seen, stats, True, None)
     dev = [s for s in CAT_SLUGS if is_device(s)]
     other = [s for s in CAT_SLUGS if not is_device(s)]
     for slug in dev:
-        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, True)
+        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, group_of(slug))
     for _ in range(min(ROTATE_BATCH, len(other))):
         slug = other[ROTATE_POS[0] % len(other)]
         ROTATE_POS[0] += 1
-        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, False)
-    stats["cats"] = {"device": len(dev), "other": len(other)}
+        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, None)
+    stats["cats"] = {"priority": dev, "other": len(other)}
     seen.update(scan_devices(session, stats))
     return seen
 
@@ -382,7 +394,7 @@ def scan(session, kinds, stats):
                 if kind == "bestsellers":
                     learn_device_pages(page, slug)
                 for it in items.values():
-                    it["device"] = True
+                    it["group"] = group_of(slug)
             seen.update(items)
     return seen
 
