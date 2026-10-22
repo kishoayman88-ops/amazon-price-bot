@@ -1,12 +1,14 @@
 name: Amazon price watch
 
+# The scan job runs for ~5h45m and checks every 3 minutes.
+# The hourly schedule queues the next job, so it restarts right away when one ends.
 on:
   schedule:
-    - cron: "17 */3 * * *"   # every 3 hours
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       test_alert:
-        description: "Send a test Telegram message"
+        description: "Only send a test Telegram message"
         type: boolean
         default: false
 
@@ -14,13 +16,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: price-bot
+  group: ${{ inputs.test_alert && 'price-bot-test' || 'price-bot' }}
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
 
@@ -30,20 +32,25 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - run: |
+          git config user.name "price-bot"
+          git config user.email "price-bot@users.noreply.github.com"
+
       - name: Check prices
         run: python bot.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_ALERT: ${{ inputs.test_alert }}
+          TEST_ONLY: ${{ inputs.test_alert }}
           DROP_PERCENT: "50"
+          RUN_MINUTES: "345"
+          FAST_EVERY: "3"
+          SLOW_EVERY: "30"
 
       - name: Save prices
         if: always()
         run: |
-          git config user.name "price-bot"
-          git config user.email "price-bot@users.noreply.github.com"
-          git add prices.json
+          git add -A
           git diff --cached --quiet || git commit -m "Update prices"
           git pull --rebase
           git push

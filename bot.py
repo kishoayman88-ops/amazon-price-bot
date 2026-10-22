@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 
 # ---------------- Settings ----------------
 BASE = "https://www.amazon.eg"
-KINDS = ["bestsellers", "movers-and-shakers"]
+
 DATA_FILE = "prices.json"
 
 DROP_PERCENT = float(os.getenv("DROP_PERCENT", "70"))   # alert at this % drop or more
@@ -214,60 +214,127 @@ def alert_text(a):
             f"https://www.amazon.eg/dp/{a['asin']}")
 
 
-# ---------------- Main ----------------
-def main():
-    test_ok = True
-    if os.getenv("TEST_ALERT", "").lower() == "true":
-        test_ok = send_telegram("✅ Amazon.eg price bot is working. "
-                      f"It will alert on drops of {DROP_PERCENT:.0f}% or more.")
+# ---------------- Loop mode ----------------
+FAST_KINDS = ["movers-and-shakers"]   # checked every FAST_EVERY minutes
+SLOW_KINDS = ["bestsellers"]          # checked every SLOW_EVERY minutes
+RUN_MINUTES = float(os.getenv("RUN_MINUTES", "0"))   # 0 = one full pass, then stop
+FAST_EVERY = float(os.getenv("FAST_EVERY", "3"))
+SLOW_EVERY = float(os.getenv("SLOW_EVERY", "30"))
+SAVE_EVERY = 30                       # minutes between saves to GitHub
 
-    db = load_db()
-    today = datetime.now(timezone(timedelta(hours=3))).date().isoformat()  # Cairo
-    session = requests.Session()
 
-    pages_ok = pages_failed = 0
+def cairo_today():
+    return datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+
+
+def scan(session, kinds, stats):
     seen = {}
-    for kind in KINDS:
+    for kind in kinds:
         root = fetch(session, f"/-/en/gp/{kind}/")
         if root is None:
-            pages_failed += 1
+            stats["failed"] += 1
             continue
-        pages_ok += 1
+        stats["ok"] += 1
         seen.update(parse_items(root))
         cats = category_paths(root, kind)[:MAX_CATEGORIES]
-        print(f"{kind}: {len(cats)} categories")
+        stats["cats"][kind] = len(cats)
         for path in cats:
             time.sleep(random.uniform(*DELAY))
             page = fetch(session, path)
             if page is None:
-                pages_failed += 1
+                stats["failed"] += 1
                 continue
-            pages_ok += 1
+            stats["ok"] += 1
             seen.update(parse_items(page))
+    return seen
 
+
+def process(db, seen, stats):
+    today = cairo_today()
     alerts = [a for asin, item in seen.items()
               if (a := check_item(db, asin, item, today))]
-    removed = forget_old(db, today)
-
+    forget_old(db, today)
     for a in sorted(alerts, key=lambda x: x["price"] / x["usual"]):
         send_telegram(alert_text(a))
         time.sleep(1)
 
-    # Tell the user (max once a day) if Amazon blocked most pages.
-    total = pages_ok + pages_failed
-    if total and pages_failed / total > 0.5 and db["meta"].get("block_notice") != today:
+    total = stats["ok"] + stats["failed"]
+    blocked = bool(total) and stats["failed"] / total > 0.5
+    if blocked and db["meta"].get("block_notice") != today:
         db["meta"]["block_notice"] = today
-        send_telegram(f"⚠️ Amazon blocked {pages_failed} of {total} pages this run. "
-                      "The bot will keep trying.")
+        send_telegram(f"⚠️ Amazon blocked {stats['failed']} of {total} pages. "
+                      "The bot will slow down and keep trying.")
 
-    db["meta"]["telegram_errors"] = TG_ERRORS[-5:]
-    db["meta"]["token_shape_ok"] = bool(re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", TOKEN))
-    db["meta"]["chat_id_shape_ok"] = bool(re.fullmatch(r"-?\d+", CHAT_ID))
-    db["meta"]["last_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    m = db["meta"]
+    m["last_check"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    m["last_pages_ok"], m["last_pages_failed"] = stats["ok"], stats["failed"]
+    m["categories"] = stats["cats"]
+    m["checks_today"] = (m.get("checks_today", 0) + 1) if m.get("checks_day") == today else 1
+    m["checks_day"] = today
+    m["alerts_total"] = m.get("alerts_total", 0) + len(alerts)
+    m["telegram_errors"] = TG_ERRORS[-5:]
     save_db(db)
-    print(f"pages ok={pages_ok} failed={pages_failed} items={len(seen)} "
-          f"tracked={len(db['items'])} alerts={len(alerts)} forgotten={removed}")
-    return 0 if test_ok else 1
+    print(f"{m['last_check']} pages ok={stats['ok']} failed={stats['failed']} "
+          f"items={len(seen)} tracked={len(db['items'])} alerts={len(alerts)}", flush=True)
+    return blocked
+
+
+def git_save(message="Update prices"):
+    import subprocess
+    for cmd in (["git", "add", DATA_FILE],
+                ["git", "commit", "-q", "-m", message],
+                ["git", "pull", "-q", "--rebase"],
+                ["git", "push", "-q"]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode and cmd[1] != "commit":     # "nothing to commit" is fine
+            print("[git]", " ".join(cmd), r.stderr[-300:], flush=True)
+            return
+
+
+# ---------------- Main ----------------
+def main():
+    # Test mode: only send a test message and record the result.
+    if os.getenv("TEST_ONLY", "").lower() == "true":
+        ok = send_telegram("✅ Amazon.eg price bot is working. "
+                           f"It checks every {FAST_EVERY:.0f} minutes and alerts on "
+                           f"drops of {DROP_PERCENT:.0f}% or more.")
+        with open("telegram_test.json", "w") as f:
+            json.dump({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                       "ok": ok, "errors": TG_ERRORS[-3:],
+                       "token_shape_ok": bool(re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", TOKEN)),
+                       "chat_id_shape_ok": bool(re.fullmatch(r"-?\d+", CHAT_ID))}, f)
+        return 0 if ok else 1
+
+    db = load_db()
+    session = requests.Session()
+    start = time.time()
+    last_slow = -1e18
+    last_save = time.time()
+
+    while True:
+        cycle_start = time.time()
+        kinds = list(FAST_KINDS)
+        if cycle_start - last_slow >= SLOW_EVERY * 60:
+            kinds += SLOW_KINDS
+            last_slow = cycle_start
+        stats = {"ok": 0, "failed": 0, "cats": {}}
+        seen = scan(session, kinds, stats)
+        blocked = process(db, seen, stats)
+
+        if RUN_MINUTES <= 0:
+            break
+        if time.time() - last_save >= SAVE_EVERY * 60:
+            git_save()
+            last_save = time.time()
+
+        wait = FAST_EVERY * 60 - (time.time() - cycle_start)
+        if blocked:
+            wait = max(wait, 10 * 60)              # back off when Amazon blocks
+            session = requests.Session()
+        if time.time() + max(wait, 0) - start > RUN_MINUTES * 60:
+            break
+        time.sleep(max(wait, 5))
+    return 0
 
 
 if __name__ == "__main__":
