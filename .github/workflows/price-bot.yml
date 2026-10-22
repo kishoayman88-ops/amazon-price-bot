@@ -1,6 +1,6 @@
 name: Amazon price watch
 
-# The scan job runs for ~5h45m and checks every 3 minutes.
+# The scan job runs for ~5h45m and checks every minute.
 # The hourly schedule queues the next job, so it restarts right away when one ends.
 on:
   schedule:
@@ -44,7 +44,7 @@ jobs:
           TEST_ONLY: ${{ inputs.test_alert }}
           DROP_PERCENT: "50"
           RUN_MINUTES: "345"
-          FAST_EVERY: "3"
+          FAST_EVERY: "1"
           SLOW_EVERY: "30"
 
       - name: Save prices

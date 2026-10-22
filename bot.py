@@ -29,9 +29,13 @@ DATA_FILE = "prices.json"
 
 DROP_PERCENT = float(os.getenv("DROP_PERCENT", "70"))   # alert at this % drop or more
 MAX_CATEGORIES = int(os.getenv("MAX_CATEGORIES", "40"))  # categories per page type
-MIN_DAYS_HISTORY = 2      # days of prices needed before an item can alert
-KEEP_DAYS = 30            # days of price history to keep per item
-DELAY = (2.0, 4.0)        # seconds to wait between pages (be gentle)
+MIN_SAMPLES = 3           # earlier prices needed (hours or days) before a drop alert
+KEEP_DAYS = 30            # days of daily prices to keep per item
+KEEP_HOURS = 24           # hours of hourly prices to keep per item
+DELAY = (1.0, 2.0)        # seconds to wait between pages
+HOT_JUMP = float(os.getenv("HOT_JUMP", "2000"))          # Movers & Shakers rank jump %
+HOT_MIN_DROP = float(os.getenv("HOT_MIN_DROP", "20"))    # and at least this % below usual
+MAX_HOT_PER_CHECK = 5
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -126,8 +130,19 @@ def parse_price(text):
     return value if value > 0 else None
 
 
-def parse_items(page):
-    """Return {asin: {"title", "price"}} from a best-seller style page."""
+def parse_jump(text):
+    """Movers & Shakers: how much the sales rank went up, in %."""
+    cur = re.search(r"Sales rank:\s*([\d,]+)", text)
+    prev = re.search(r"previously\s+([\d,]+)", text)
+    if cur and prev:
+        c, p = int(cur.group(1).replace(",", "")), int(prev.group(1).replace(",", ""))
+        return (p / c - 1) * 100 if c else None
+    m = re.search(r"(?<![-\d,.])(\d[\d,]*)\s?%", text)
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+def parse_items(page, movers=False):
+    """Return {asin: {"title", "price", ...}} from a best-seller style page."""
     soup = BeautifulSoup(page, "html.parser")
     cards = soup.select('[id="gridItemRoot"]') or soup.select("div[data-asin]")
     items = {}
@@ -142,13 +157,20 @@ def parse_items(page):
             asin = m.group(1) if m else None
         if not asin or not re.fullmatch(r"[A-Z0-9]{10}", asin):
             continue
-        price = parse_price(card.get_text(" ", strip=True))
+        text = card.get_text(" ", strip=True)
+        price = parse_price(text)
         if price is None:
             continue
         img = card.find("img", alt=True)
         title = (img["alt"].strip() if img and img["alt"].strip()
                  else card.get_text(" ", strip=True)[:120])
-        items[asin] = {"title": title[:200], "price": price}
+        item = {"title": title[:200], "price": price}
+        disc = re.search(r"-\s?(\d{1,2})\s?%", text)       # Amazon's own discount badge
+        if disc:
+            item["disc"] = int(disc.group(1))
+        if movers:
+            item["jump"] = parse_jump(text)
+        items[asin] = item
     return items
 
 
@@ -170,30 +192,49 @@ def save_db(db):
 
 
 def check_item(db, asin, item, today):
-    """Update history; return alert dict or None."""
+    """Update history; return an alert dict or None."""
     rec = db["items"].setdefault(asin, {"t": item["title"], "h": {}, "alerted": None})
     rec["t"] = item["title"]
     rec["seen"] = today
     price = item["price"]
+    hour = datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H")
+    recent = rec.setdefault("r", {})
 
-    past = [p for d, p in rec["h"].items() if d != today]
+    past = ([p for d, p in rec["h"].items() if d != today]
+            + [p for h, p in recent.items() if h != hour])
+    usual = statistics.median(past) if len(past) >= MIN_SAMPLES else None
+    base = {"asin": asin, "title": item["title"], "device": item.get("device", False),
+            "price": price, "usual": usual}
     alert = None
-    if len(past) >= MIN_DAYS_HISTORY:
-        usual = statistics.median(past)
-        limit = usual * (1 - DROP_PERCENT / 100)
-        if price <= limit:
+
+    # 1) Price drop vs the item's usual price
+    if usual:
+        if price <= usual * (1 - DROP_PERCENT / 100):
             last = rec.get("alerted")
             if last is None or price < last:      # alert again only if even lower
                 rec["alerted"] = price
-                alert = {"asin": asin, "title": item["title"], "device": item.get("device", False),
-                         "price": price, "usual": usual}
+                alert = dict(base, type="drop")
         else:
             rec["alerted"] = None                  # price recovered -> reset
 
+    # 2) Amazon's own discount badge (works from the first time we see the item)
+    if not alert and item.get("disc", 0) >= DROP_PERCENT and rec.get("dd") != today:
+        rec["dd"] = today
+        alert = dict(base, type="disc", disc=item["disc"])
+
+    # 3) Hot deal: shooting up Movers & Shakers (and not more expensive than usual)
+    jump = item.get("jump") or 0
+    if (not alert and jump >= HOT_JUMP and rec.get("hd") != today
+            and (usual is None or price <= usual * (1 - HOT_MIN_DROP / 100))):
+        rec["hd"] = today
+        alert = dict(base, type="hot", jump=jump)
+
     rec["h"][today] = price                        # one price per day (latest)
-    if len(rec["h"]) > KEEP_DAYS:
-        for d in sorted(rec["h"])[:-KEEP_DAYS]:
-            del rec["h"][d]
+    recent[hour] = price                           # one price per hour (latest)
+    for d in sorted(rec["h"])[:-KEEP_DAYS]:
+        del rec["h"][d]
+    for h in sorted(recent)[:-KEEP_HOURS]:
+        del recent[h]
     return alert
 
 
@@ -206,20 +247,26 @@ def forget_old(db, today):
 
 
 def alert_text(a):
-    drop = round((1 - a["price"] / a["usual"]) * 100)
-    label = "⚡ <b>Device deal</b> · " if a.get("device") else "🔥 "
-    return (f"{label}<b>Price drop {drop}%</b>\n"
-            f"{html.escape(a['title'])}\n\n"
-            f"Now: <b>EGP {a['price']:,.2f}</b>\n"
-            f"Usual: EGP {a['usual']:,.2f}\n"
-            f"https://www.amazon.eg/dp/{a['asin']}")
+    dev = "⚡ <b>Device</b> · " if a.get("device") else ""
+    title = html.escape(a["title"])
+    link = f"https://www.amazon.eg/dp/{a['asin']}"
+    usual = (f"Usual: EGP {a['usual']:,.2f} "
+             f"(-{round((1 - a['price'] / a['usual']) * 100)}%)\n") if a.get("usual") else ""
+    if a["type"] == "drop":
+        head = f"🔥 <b>Price drop {round((1 - a['price'] / a['usual']) * 100)}%</b>"
+    elif a["type"] == "disc":
+        head = f"🏷️ <b>Amazon discount -{a['disc']}%</b>"
+    else:
+        head = f"🚀 <b>Hot deal</b> · selling fast (rank +{a['jump']:,.0f}%)"
+    return (f"{dev}{head}\n{title}\n\n"
+            f"Now: <b>EGP {a['price']:,.2f}</b>\n{usual}{link}")
 
 
 # ---------------- Loop mode ----------------
-FAST_KINDS = ["movers-and-shakers"]   # checked every FAST_EVERY minutes
+
 SLOW_KINDS = ["bestsellers"]          # checked every SLOW_EVERY minutes
 RUN_MINUTES = float(os.getenv("RUN_MINUTES", "0"))   # 0 = one full pass, then stop
-FAST_EVERY = float(os.getenv("FAST_EVERY", "3"))
+FAST_EVERY = float(os.getenv("FAST_EVERY", "1"))
 SLOW_EVERY = float(os.getenv("SLOW_EVERY", "30"))
 SAVE_EVERY = 30                       # minutes between saves to GitHub
 
@@ -233,7 +280,9 @@ CAT_SLUGS = []   # category names learned from Best Sellers, reused for Movers &
 # ---- Electric devices: deeper scan of sub-categories ----
 DEVICE_WORDS = ("electronic", "computer", "appliance", "kitchen", "phone",
                 "tv", "camera", "video-game", "office-product")
-DEVICE_BATCH = int(os.getenv("DEVICE_BATCH", "10"))       # sub-pages per 3-min check
+DEVICE_BATCH = int(os.getenv("DEVICE_BATCH", "4"))        # device sub-pages per check
+ROTATE_BATCH = int(os.getenv("ROTATE_BATCH", "4"))        # other categories per check
+ROTATE_POS = [0]
 MAX_DEVICE_PAGES = int(os.getenv("MAX_DEVICE_PAGES", "300"))
 DEVICE_PAGES = []       # rotating list of device sub-category pages
 DEVICE_POS = [0]
@@ -266,10 +315,42 @@ def scan_devices(session, stats):
         stats["ok"] += 1
         if "/bestsellers/" in path:          # go one level deeper
             learn_device_pages(page, path.split("/")[5])
-        for asin, item in parse_items(page).items():
+        for asin, item in parse_items(page, movers="movers-and-shakers" in path).items():
             item["device"] = True
             seen[asin] = item
     stats["device_pages"] = len(DEVICE_PAGES)
+    return seen
+
+
+def fetch_into(session, path, seen, stats, movers, device):
+    time.sleep(random.uniform(*DELAY))
+    page = fetch(session, path)
+    if page is None:
+        stats["failed"] += 1
+        return
+    stats["ok"] += 1
+    for asin, item in parse_items(page, movers=movers).items():
+        if device:
+            item["device"] = True
+        seen[asin] = item
+
+
+def scan_fast(session, stats):
+    """Every minute: Movers & Shakers main page + device categories,
+    plus a few other categories and device sub-pages in rotation."""
+    seen = {}
+    kind = "movers-and-shakers"
+    fetch_into(session, f"/-/en/gp/{kind}/", seen, stats, True, False)
+    dev = [s for s in CAT_SLUGS if is_device(s)]
+    other = [s for s in CAT_SLUGS if not is_device(s)]
+    for slug in dev:
+        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, True)
+    for _ in range(min(ROTATE_BATCH, len(other))):
+        slug = other[ROTATE_POS[0] % len(other)]
+        ROTATE_POS[0] += 1
+        fetch_into(session, f"/-/en/gp/{kind}/{slug}/", seen, stats, True, False)
+    stats["cats"] = {"device": len(dev), "other": len(other)}
+    seen.update(scan_devices(session, stats))
     return seen
 
 
@@ -281,7 +362,7 @@ def scan(session, kinds, stats):
             stats["failed"] += 1
             continue
         stats["ok"] += 1
-        seen.update(parse_items(root))
+        seen.update(parse_items(root, movers=(kind == "movers-and-shakers")))
         cats = category_paths(root, kind)[:MAX_CATEGORIES]
         if kind == "bestsellers" and cats:
             CAT_SLUGS[:] = [c.rstrip("/").split("/")[-1] for c in cats]
@@ -296,7 +377,7 @@ def scan(session, kinds, stats):
                 continue
             stats["ok"] += 1
             slug = path.rstrip("/").split("/")[-1]
-            items = parse_items(page)
+            items = parse_items(page, movers=(kind == "movers-and-shakers"))
             if is_device(slug):
                 if kind == "bestsellers":
                     learn_device_pages(page, slug)
@@ -311,7 +392,11 @@ def process(db, seen, stats):
     alerts = [a for asin, item in seen.items()
               if (a := check_item(db, asin, item, today))]
     forget_old(db, today)
-    for a in sorted(alerts, key=lambda x: x["price"] / x["usual"]):
+    order = {"drop": 0, "disc": 1, "hot": 2}
+    alerts.sort(key=lambda x: (order[x["type"]], -(x.get("jump") or 0)))
+    hot = [a for a in alerts if a["type"] == "hot"]
+    alerts = [a for a in alerts if a["type"] != "hot"] + hot[:MAX_HOT_PER_CHECK]
+    for a in alerts:
         send_telegram(alert_text(a))
         time.sleep(1)
 
@@ -354,7 +439,7 @@ def main():
     # Test mode: only send a test message and record the result.
     if os.getenv("TEST_ONLY", "").lower() == "true":
         ok = send_telegram("✅ Amazon.eg price bot is working. "
-                           f"It checks every {FAST_EVERY:.0f} minutes and alerts on "
+                           f"It checks every {FAST_EVERY:g} minute(s) and alerts on "
                            f"drops of {DROP_PERCENT:.0f}% or more.")
         with open("telegram_test.json", "w") as f:
             json.dump({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -371,13 +456,12 @@ def main():
 
     while True:
         cycle_start = time.time()
-        kinds = list(FAST_KINDS)
-        if cycle_start - last_slow >= SLOW_EVERY * 60:
-            kinds = SLOW_KINDS + kinds      # Best Sellers first, to learn the categories
-            last_slow = cycle_start
         stats = {"ok": 0, "failed": 0, "cats": {}}
-        seen = scan(session, kinds, stats)
-        seen.update(scan_devices(session, stats))
+        seen = {}
+        if cycle_start - last_slow >= SLOW_EVERY * 60:   # full Best Sellers pass
+            seen.update(scan(session, SLOW_KINDS, stats))
+            last_slow = cycle_start
+        seen.update(scan_fast(session, stats))
         blocked = process(db, seen, stats)
 
         if RUN_MINUTES <= 0:
