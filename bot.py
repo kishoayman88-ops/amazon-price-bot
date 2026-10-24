@@ -34,8 +34,12 @@ BASE = "https://www.amazon.eg"
 DATA_FILE = "prices.json"
 
 DROP_PERCENT = float(os.getenv("DROP_PERCENT", "50"))
-HOT_JUMP = float(os.getenv("HOT_JUMP", "2000"))          # Movers & Shakers rank jump %
-HOT_MIN_DROP = float(os.getenv("HOT_MIN_DROP", "20"))    # ...and at least this % below usual
+HOT_FROM_RANK = int(os.getenv("HOT_FROM_RANK", "30"))    # hot deal: was #30 or lower...
+HOT_TO_RANK = int(os.getenv("HOT_TO_RANK", "5"))         # ...now in the top 5
+HOT_MIN_DROP = float(os.getenv("HOT_MIN_DROP", "20"))    # ...and at least 20% below usual
+HOT_MIN_DISC = float(os.getenv("HOT_MIN_DISC", "30"))    # (or Amazon -30% if no history yet)
+STABLE_RATIO = 1.6       # history must be steady (max <= 1.6 x min) to trust the usual price
+MAX_CONFIRMS = 6         # product-page checks per round (stops alert storms)
 WATCH_DROP = float(os.getenv("WATCH_DROP", "5"))         # watchlist: alert on any drop of 5%+
 MAX_CATEGORIES = int(os.getenv("MAX_CATEGORIES", "40"))
 PRIORITY_BATCH = int(os.getenv("DEVICE_BATCH", "4"))     # priority sub-pages per check
@@ -49,7 +53,7 @@ FAST_EVERY = float(os.getenv("FAST_EVERY", "1"))
 SLOW_EVERY = float(os.getenv("SLOW_EVERY", "30"))
 SAVE_EVERY = 30                                          # minutes between saves to GitHub
 
-MIN_SAMPLES = 3          # earlier prices (hours or days) needed before a drop alert
+MIN_SAMPLES = 4          # earlier prices (hours or days) needed before a drop alert
 KEEP_DAYS = 30
 KEEP_HOURS = 24
 DELAY = (1.0, 2.0)       # seconds between pages
@@ -159,64 +163,79 @@ def parse_price(text):
     return value if value > 0 else None
 
 
-def parse_jump(text):
-    """Movers & Shakers: how much the sales rank went up, in %."""
-    cur = re.search(r"Sales rank:\s*([\d,]+)", text)
-    prev = re.search(r"previously\s+([\d,]+)", text)
-    if cur and prev:
-        c, p = int(cur.group(1).replace(",", "")), int(prev.group(1).replace(",", ""))
-        return (p / c - 1) * 100 if c else None
-    m = re.search(r"(?<![-\d,.])(\d[\d,]*)\s?%", text)
-    return float(m.group(1).replace(",", "")) if m else None
+def price_from_parts(el):
+    """Amazon a-price block -> float, using whole + fraction (offscreen text can lose the dot)."""
+    whole = el.select_one(".a-price-whole")
+    if whole:
+        w = re.sub(r"[^\d]", "", whole.get_text())
+        frac = el.select_one(".a-price-fraction")
+        f = re.sub(r"[^\d]", "", frac.get_text()) if frac else "0"
+        if w:
+            return float(f"{w}.{f or 0}")
+    return parse_price(el.get_text(" ", strip=True))
 
 
-def parse_items(page, movers=False):
-    """{asin: {title, price, disc?, jump?}} from a Best Sellers / Movers & Shakers page."""
+def parse_items(page):
+    """Best Sellers page -> {asin: {title, price, rank}}.
+    Only the main buy-box price is used. Cards showing 'N offers from ...' (other sellers,
+    usually when the main listing is out of stock) are skipped - they are not the real price."""
     soup = BeautifulSoup(page, "html.parser")
-    cards = soup.select('[id="gridItemRoot"]') or soup.select("div[data-asin]")
     items = {}
-    for card in cards:
-        asin = card.get("data-asin")
-        if not asin:
-            inner = card.select_one("[data-asin]")
-            asin = inner.get("data-asin") if inner else None
+    for card in soup.select('[id="gridItemRoot"]'):
+        inner = card.select_one("[data-asin]")
+        asin = inner.get("data-asin") if inner else None
         if not asin:
             link = card.find("a", href=ASIN_RE)
             m = ASIN_RE.search(link["href"]) if link else None
             asin = m.group(1) if m else None
         if not asin or not re.fullmatch(r"[A-Z0-9]{10}", asin):
             continue
-        text = card.get_text(" ", strip=True)
-        price = parse_price(text)
+        el = card.select_one('[class*="p13n-sc-price_"]') or card.select_one(".p13n-sc-price")
+        price = parse_price(el.get_text(" ", strip=True)) if el else None
         if price is None:
             continue
+        text = card.get_text(" ", strip=True)
         img = card.find("img", alt=True)
         title = img["alt"].strip() if img and img["alt"].strip() else text[:120]
-        item = {"title": title[:200], "price": price}
-        disc = re.search(r"-\s?(\d{1,2})\s?%", text)          # Amazon's own discount badge
-        if disc:
-            item["disc"] = int(disc.group(1))
-        if movers:
-            item["jump"] = parse_jump(text)
-        items[asin] = item
+        rank = re.match(r"#(\d+)", text)
+        items[asin] = {"title": title[:200], "price": price,
+                       "rank": int(rank.group(1)) if rank else None}
     return items
 
 
 def parse_product(page):
-    """Product page -> (title, price or None, in_stock)."""
+    """Product page -> {title, price, list_price, disc, in_stock, seller}."""
     soup = BeautifulSoup(page, "html.parser")
     t = soup.select_one("#productTitle")
-    title = t.get_text(" ", strip=True)[:200] if t else ""
-    price = None
-    for sel in ("#corePrice_feature_div .a-offscreen", "#corePriceDisplay_desktop_feature_div .a-offscreen",
-                "#apex_desktop .a-offscreen", ".priceToPay .a-offscreen", "#price_inside_buybox"):
+    out = {"title": t.get_text(" ", strip=True)[:200] if t else "", "price": None,
+           "list_price": None, "disc": None, "in_stock": False, "seller": None}
+    for sel in ("#corePriceDisplay_desktop_feature_div .priceToPay",
+                "#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price)",
+                "#corePrice_feature_div .a-price:not(.a-text-price)",
+                "#apex_desktop .a-price:not(.a-text-price)"):
         el = soup.select_one(sel)
-        if el and (price := parse_price(el.get_text(" ", strip=True))):
+        if el and (v := price_from_parts(el)):
+            out["price"] = v
             break
+    core = soup.select_one("#corePriceDisplay_desktop_feature_div") or soup.select_one("#apex_desktop")
+    core_text = core.get_text(" ", strip=True) if core else ""
+    lp = re.search(r"List Price:\s*EGP\s*([\d,]+\.\d{2})", core_text)
+    if lp:
+        out["list_price"] = float(lp.group(1).replace(",", ""))
+    d = re.search(r"-\s?(\d{1,2})\s?%", core_text)
+    if d:
+        out["disc"] = int(d.group(1))
+    box = soup.select_one("#buybox")
+    box_text = box.get_text(" ", strip=True).lower() if box else ""
     avail = soup.select_one("#availability")
     avail_text = avail.get_text(" ", strip=True).lower() if avail else ""
-    in_stock = price is not None and "unavailable" not in avail_text and "out of stock" not in avail_text
-    return title, price, in_stock
+    unavailable = "currently unavailable" in avail_text or "out of stock" in avail_text
+    out["in_stock"] = bool(out["price"]) and not unavailable and (
+        "in stock" in box_text or "in stock" in avail_text or bool(soup.select_one("#add-to-cart-button")))
+    sold = re.search(r"sold by:?\s*([^|]{2,40}?)(?:\s{2,}|$| free| returns| payment)", box_text)
+    if sold:
+        out["seller"] = sold.group(1).strip().title()
+    return out
 
 
 def group_of(slug):
@@ -255,8 +274,8 @@ def git_save(message="Update prices"):
 
 
 # ---------------- Deal logic ----------------
-def check_item(db, asin, item, today):
-    """Update price history; return an alert dict or None."""
+def check_item(db, asin, item, today, list_key=""):
+    """Record a buy-box price; return a deal *candidate* (confirmed later) or None."""
     rec = db["items"].setdefault(asin, {"t": item["title"], "h": {}, "alerted": None})
     rec["t"] = item["title"]
     rec["seen"] = today
@@ -267,26 +286,27 @@ def check_item(db, asin, item, today):
     past = ([p for d, p in rec["h"].items() if d != today]
             + [p for h, p in recent.items() if h != hour])
     usual = statistics.median(past) if len(past) >= MIN_SAMPLES else None
-    lowest = min(past) if past else None
+    stable = bool(past) and max(past) <= min(past) * STABLE_RATIO   # usual price is trustworthy
     base = {"asin": asin, "title": item["title"], "group": item.get("group"),
-            "price": price, "usual": usual, "lowest": lowest}
-    alert = None
+            "price": price, "usual": usual if stable else None,
+            "lowest": min(past) if past else None, "samples": len(past)}
+    cand = None
 
-    if usual:                                                     # 1) price drop
+    if usual and stable:                                          # 1) price drop
         if price <= usual * (1 - DROP_PERCENT / 100):
-            if rec.get("alerted") is None or price < rec["alerted"]:
-                rec["alerted"] = price
-                alert = dict(base, type="drop")
+            if rec.get("alerted") is None or price < rec["alerted"] * 0.98:
+                cand = dict(base, type="drop")
         else:
             rec["alerted"] = None
-    if not alert and item.get("disc", 0) >= DROP_PERCENT and rec.get("dd") != today:
-        rec["dd"] = today                                         # 2) Amazon's badge
-        alert = dict(base, type="disc", disc=item["disc"])
-    jump = item.get("jump") or 0
-    if (not alert and jump >= HOT_JUMP and rec.get("hd") != today      # 3) hot deal
-            and (usual is None or price <= usual * (1 - HOT_MIN_DROP / 100))):
-        rec["hd"] = today
-        alert = dict(base, type="hot", jump=jump)
+
+    rank = item.get("rank")                                       # 2) hot: rank jump
+    if rank and list_key:
+        ranks = rec.setdefault("rk", {})
+        prev = ranks.get(list_key)
+        ranks[list_key] = rank
+        if (not cand and prev and prev >= HOT_FROM_RANK and rank <= HOT_TO_RANK
+                and rec.get("hd") != today):
+            cand = dict(base, type="hot", prev_rank=prev, rank=rank)
 
     rec["h"][today] = price
     recent[hour] = price
@@ -294,7 +314,9 @@ def check_item(db, asin, item, today):
         del rec["h"][d]
     for h in sorted(recent)[:-KEEP_HOURS]:
         del recent[h]
-    return alert
+    if cand and rec.get("nochk") == hour:     # confirmed as not-a-deal this hour already
+        return None
+    return cand
 
 
 def pct_below(price, ref):
@@ -305,17 +327,20 @@ def alert_text(a):
     tag = {"device": "⚡ <b>Device</b> · ", "market": "🛒 <b>Supermarket</b> · "}.get(a.get("group"), "")
     if a["type"] == "drop":
         head = f"🔥 <b>Price drop {pct_below(a['price'], a['usual'])}%</b>"
-    elif a["type"] == "disc":
-        head = f"🏷️ <b>Amazon discount -{a['disc']}%</b>"
     elif a["type"] == "hot":
-        head = f"🚀 <b>Hot deal</b> · selling fast (rank +{a['jump']:,.0f}%)"
+        head = f"🚀 <b>Hot deal</b> · jumped #{a['prev_rank']} → #{a['rank']} in Best Sellers"
     else:
         head = a["head"]
-    lines = [f"{tag}{head}", html.escape(a["title"]), "", f"Now: <b>EGP {a['price']:,.2f}</b>"]
+    lines = [f"{tag}{head}", html.escape(a["title"]), "",
+             f"Now: <b>EGP {a['price']:,.2f}</b>" + ("  ✅ checked" if a.get("confirmed") else "")]
     if a.get("usual") and a["type"] != "watch":
-        lines.append(f"Usual: EGP {a['usual']:,.2f} (-{pct_below(a['price'], a['usual'])}%)")
+        lines.append(f"Usual (bot history): EGP {a['usual']:,.2f} (-{pct_below(a['price'], a['usual'])}%)")
     if a.get("lowest") and a["lowest"] > 0:
         lines.append(f"Lowest seen before: EGP {a['lowest']:,.2f}")
+    if a.get("list_price") and a["list_price"] > a["price"]:
+        lines.append(f"Amazon list price: EGP {a['list_price']:,.2f} (-{pct_below(a['price'], a['list_price'])}%)")
+    if a.get("seller"):
+        lines.append(f"Sold by: {html.escape(a['seller'])}")
     lines.append(f"{BASE}/dp/{a['asin']}")
     return "\n".join(lines)
 
@@ -333,17 +358,43 @@ class Sniper:
         self.stats = None
         self.alerts = 0
 
-    # -- emit: check items the moment a page is read, alert instantly --
-    def emit(self, items, group=None):
+    # -- emit: check items the moment a page is read; confirm candidates, alert instantly --
+    def emit(self, items, group=None, list_key=""):
         today = cairo_today()
         for asin, item in items.items():
             if group:
                 item["group"] = group
-            a = check_item(self.db, asin, item, today)
-            if a:
-                send_telegram(alert_text(a), asin)
-                self.alerts += 1
+            cand = check_item(self.db, asin, item, today, list_key)
+            if cand and self.stats["confirms"] < MAX_CONFIRMS:
+                self.confirm(cand)
         self.stats["items"] += len(items)
+
+    def confirm(self, c):
+        """Open the product page and alert only if the deal is real and in stock."""
+        self.stats["confirms"] += 1
+        rec = self.db["items"][c["asin"]]
+        page = self.get(f"/-/en/dp/{c['asin']}")
+        if not page:
+            return
+        p = parse_product(page)
+        price, ok = p["price"], False
+        if p["in_stock"] and price:
+            if c["type"] == "drop":
+                ok = price <= c["usual"] * (1 - DROP_PERCENT / 100)
+            else:   # hot: selling fast AND clearly cheaper than usual (or a real Amazon discount)
+                ok = ((c.get("usual") and price <= c["usual"] * (1 - HOT_MIN_DROP / 100))
+                      or (not c.get("usual") and (p["disc"] or 0) >= HOT_MIN_DISC))
+        hour = datetime.now(CAIRO).strftime("%Y-%m-%dT%H")
+        if not ok:
+            rec["nochk"] = hour
+            return
+        c.update(price=price, confirmed=True, list_price=p["list_price"], seller=p["seller"])
+        if c["type"] == "drop":
+            rec["alerted"] = price
+        else:
+            rec["hd"] = cairo_today()
+        send_telegram(alert_text(c), c["asin"])
+        self.alerts += 1
 
     def get(self, path):
         time.sleep(random.uniform(*DELAY))
@@ -351,14 +402,14 @@ class Sniper:
         self.stats["ok" if page else "failed"] += 1
         return page
 
-    def read(self, path, movers, group=None):
+    def read(self, path, group=None):
         page = self.get(path)
         if page:
-            items = parse_items(page, movers)
-            self.emit(items, group)
-            # Stop wasting requests on pages that never show priced products
+            items = parse_items(page)
+            key = path.split("/gp/bestsellers/")[-1].strip("/")
+            self.emit(items, group, key)
             self.empty[path] = 0 if items else self.empty.get(path, 0) + 1
-            if self.empty[path] >= 3:
+            if self.empty[path] >= 3:              # stop wasting requests on empty pages
                 for lst in (self.priority_pages, self.other_pages, self.page2):
                     if path in lst:
                         lst.remove(path)
@@ -368,10 +419,9 @@ class Sniper:
         lst = self.priority_pages if group_of(slug) else self.other_pages
         cap = MAX_PRIORITY_PAGES if group_of(slug) else MAX_PRIORITY_PAGES // 2
         for node in re.findall(rf"/gp/bestsellers/{re.escape(slug)}/(\d+)", page):
-            for kind in ("movers-and-shakers", "bestsellers"):
-                p = f"/-/en/gp/{kind}/{slug}/{node}/"
-                if p not in lst and len(lst) < cap and self.empty.get(p, 0) < 3:
-                    lst.append(p)
+            p = f"/-/en/gp/bestsellers/{slug}/{node}/"
+            if p not in lst and len(lst) < cap and self.empty.get(p, 0) < 3:
+                lst.append(p)
 
     def rotate(self, lst, key, n):
         for _ in range(min(n, len(lst))):
@@ -380,44 +430,44 @@ class Sniper:
             path = lst[self.pos[key] % len(lst)]
             self.pos[key] += 1
             slug = path.split("/")[5]
-            page = self.read(path, "movers-and-shakers" in path, group_of(slug))
-            if page and "/bestsellers/" in path and "?pg=" not in path:
+            page = self.read(path, group_of(slug))
+            if page and "?pg=" not in path:
                 self.learn(page, slug)
 
-    # -- every 30 min: all Best Sellers categories --
+    # -- every 30 min: every Best Sellers category, pages 1 and 2 --
     def scan_slow(self):
         root = self.get("/-/en/gp/bestsellers/")
         if not root:
             return
-        self.emit(parse_items(root))
         cats = category_paths(root, "bestsellers")[:MAX_CATEGORIES]
         if cats:
             self.slugs = [c.rstrip("/").split("/")[-1] for c in cats]
         for path in cats:
             slug = path.rstrip("/").split("/")[-1]
-            page = self.read(path, False, group_of(slug))
+            if group_of(slug):
+                continue                               # priority ones are read every minute
+            page = self.read(path)
             if page:
                 self.learn(page, slug)
             if self.empty.get(path + "?pg=2", 0) < 3:
-                self.read(path + "?pg=2", False, group_of(slug))     # ~20 more products
-        # page 2 of Movers & Shakers for priority categories, read in the fast loop
-        self.page2 = [f"/-/en/gp/movers-and-shakers/{s}/?pg=2" for s in self.slugs
-                      if group_of(s) and self.empty.get(f"/-/en/gp/movers-and-shakers/{s}/?pg=2", 0) < 3]
+                self.read(path + "?pg=2")
+        self.page2 = [f"/-/en/gp/bestsellers/{s}/?pg=2" for s in self.slugs
+                      if group_of(s) and self.empty.get(f"/-/en/gp/bestsellers/{s}/?pg=2", 0) < 3]
 
-    # -- every minute: hottest pages first --
+    # -- every minute: devices & supermarket first, then rotation --
     def scan_fast(self):
-        kind = "movers-and-shakers"
-        self.read(f"/-/en/gp/{kind}/", True)
         pri = [s for s in self.slugs if group_of(s)]
         other = [s for s in self.slugs if not group_of(s)]
         for slug in pri:
-            self.read(f"/-/en/gp/{kind}/{slug}/", True, group_of(slug))
+            page = self.read(f"/-/en/gp/bestsellers/{slug}/", group_of(slug))
+            if page:
+                self.learn(page, slug)
+        self.rotate(self.page2, "pg2", 2)
+        self.rotate(self.priority_pages, "pri", PRIORITY_BATCH)
         for _ in range(min(ROTATE_BATCH, len(other))):
             slug = other[self.pos["rot"] % len(other)]
             self.pos["rot"] += 1
-            self.read(f"/-/en/gp/{kind}/{slug}/", True)
-        self.rotate(self.page2, "pg2", 2)
-        self.rotate(self.priority_pages, "pri", PRIORITY_BATCH)
+            self.read(f"/-/en/gp/bestsellers/{slug}/")
         self.rotate(self.other_pages, "oth", 2)
         self.stats["cats"] = {"priority": pri, "other": len(other),
                               "priority_sub_pages": len(self.priority_pages),
@@ -431,10 +481,11 @@ class Sniper:
         for _ in range(min(WATCH_BATCH, len(asins))):
             asin = asins[self.pos["watch"] % len(asins)]
             self.pos["watch"] += 1
-            page = self.get(f"/dp/{asin}")
+            page = self.get(f"/-/en/dp/{asin}")
             if not page:
                 continue
-            title, price, in_stock = parse_product(page)
+            p = parse_product(page)
+            title, price, in_stock = p["title"], p["price"], p["in_stock"]
             w = watch[asin]
             w["t"] = title or w.get("t", asin)
             last, was_in = w.get("last"), w.get("in_stock", True)
@@ -573,6 +624,9 @@ def main():
         return 0 if ok else 1
 
     db = load_db()
+    if db["meta"].get("schema") != 2:          # old history mixed in wrong prices -> start clean
+        db["items"] = {}
+        db["meta"]["schema"] = 2
     sniper = Sniper(db)
     tg("setMyCommands", commands=[            # shows the command menu in Telegram
         {"command": "watch", "description": "Watch an item: /watch <link> <target price>"},
@@ -588,7 +642,7 @@ def main():
 
     while True:
         cycle_start = time.time()
-        sniper.stats = {"ok": 0, "failed": 0, "items": 0, "cats": {}}
+        sniper.stats = {"ok": 0, "failed": 0, "items": 0, "cats": {}, "confirms": 0}
         sniper.alerts = 0
         if cycle_start - last_slow >= SLOW_EVERY * 60:
             sniper.scan_slow()
