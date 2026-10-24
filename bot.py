@@ -232,9 +232,16 @@ def parse_product(page):
     unavailable = "currently unavailable" in avail_text or "out of stock" in avail_text
     out["in_stock"] = bool(out["price"]) and not unavailable and (
         "in stock" in box_text or "in stock" in avail_text or bool(soup.select_one("#add-to-cart-button")))
-    sold = re.search(r"sold by:?\s*([^|]{2,40}?)(?:\s{2,}|$| free| returns| payment)", box_text)
-    if sold:
-        out["seller"] = sold.group(1).strip().title()
+    for sel in ("#sellerProfileTriggerId", "#merchantInfoFeature_feature_div .offer-display-feature-text",
+                "#tabular-buybox .tabular-buybox-text[tabular-attribute-name='Sold by']"):
+        el = soup.select_one(sel)
+        if el and el.get_text(strip=True):
+            out["seller"] = el.get_text(" ", strip=True)[:40]
+            break
+    if not out["seller"]:
+        sold = re.search(r"sold by:?\s*([a-z0-9][^|]{1,38}?)(?:\s+(?:free|returns|payment|and|delivery)|$)", box_text)
+        if sold:
+            out["seller"] = sold.group(1).strip().replace("amazon.eg", "Amazon.eg")
     return out
 
 
